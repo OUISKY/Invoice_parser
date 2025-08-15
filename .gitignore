@@ -4,7 +4,6 @@ venv/
 env/
 
 # Data directories (contain processed files)
-data/
 parsed_data/
 
 # Python

@@ -176,6 +176,14 @@ def parse_pages_to_entities(images, source_path: Path):
 		encoding, word_ids = encode_page(img, words, boxes)
 		labels = predict_labels(encoding)
 		word_triplets = align_predictions_to_words(labels, word_ids, words)
+		
+		# Debug: Print model labels and sample predictions
+		if i == 0:  # Only print for first page
+			print(f"\nModel labels: {list(model.config.id2label.values())}")
+			print(f"Sample word predictions (first 20):")
+			for j, (word, label, wid) in enumerate(word_triplets[:20]):
+				print(f"  {word} -> {label}")
+			print()
 
 		# map model label bases -> desired fields
 		def norm(label):
@@ -183,25 +191,47 @@ def parse_pages_to_entities(images, source_path: Path):
 			base = base.upper().replace("-", "").replace("_", "")
 			return tag, base
 
+		# More comprehensive label mapping
 		label_to_field = {
-			"ITEM": "name", "DESCRIPTION": "name", "PRODUCT": "name",
-			"REF": "reference", "REFERENCE": "reference", "SKU": "reference", "ITEMNO": "reference",
-			"QTY": "qte", "QUANTITY": "qte",
-			"PRICE": "price", "UNITPRICE": "price", "UNITCOST": "price", "AMOUNT": "price", "LINEPRICE": "price",
-			"TOTAL": "total", "GRANDTOTAL": "total", "TOTALAMOUNT": "total", "AMOUNTDUE": "total"
+			# Item names
+			"ITEM": "name", "DESCRIPTION": "name", "PRODUCT": "name", "SERVICE": "name", "GOODS": "name",
+			"NAME": "name", "TITLE": "name", "DETAILS": "name",
+			
+			# References/SKUs
+			"REF": "reference", "REFERENCE": "reference", "SKU": "reference", "ITEMNO": "reference", 
+			"CODE": "reference", "PARTNO": "reference", "MODEL": "reference", "ID": "reference",
+			
+			# Quantities
+			"QTY": "qte", "QUANTITY": "qte", "QTY": "qte", "AMOUNT": "qte", "UNITS": "qte",
+			
+			# Prices
+			"PRICE": "price", "UNITPRICE": "price", "UNITCOST": "price", "RATE": "price", 
+			"COST": "price", "VALUE": "price", "AMOUNT": "price", "LINEPRICE": "price",
+			"SUBTOTAL": "price", "LINEAMOUNT": "price",
+			
+			# Totals
+			"TOTAL": "total", "GRANDTOTAL": "total", "TOTALAMOUNT": "total", "AMOUNTDUE": "total",
+			"BALANCE": "total", "DUE": "total", "FINAL": "total", "SUM": "total"
 		}
 
 		# collect tokens with geometry
 		toks = []
+		matched_labels = set()
 		for word, label, wid in word_triplets:
 			tag, base = norm(label)
 			field = label_to_field.get(base)
 			if not field:
 				continue
+			matched_labels.add(base)
 			x0 = boxes[wid][0]
 			yctr = (boxes[wid][1] + boxes[wid][3]) // 2
 			toks.append((yctr, x0, field, tag, word, wid))
 		toks.sort()  # by y then x
+		
+		# Debug: Show what labels were matched
+		if i == 0:
+			print(f"Matched labels: {matched_labels}")
+			print(f"Total tokens found: {len(toks)}")
 
 		# extract total (last span labeled as total)
 		total_spans, cur, prev_y = [], [], None
@@ -220,7 +250,7 @@ def parse_pages_to_entities(images, source_path: Path):
 		total_value = total_spans[-1] if total_spans else None
 
 		# group line items by y (merge tokens close in y)
-		line_tol = 10
+		line_tol = 15  # Increased tolerance
 		lines = []
 		for y, x, field, tag, word, wid in toks:
 			if field == "total":
@@ -238,6 +268,16 @@ def parse_pages_to_entities(images, source_path: Path):
 					item[key] = " ".join(w for x, w in sorted(parts[key], key=lambda t: t[0]))
 			if item:
 				items.append(item)
+		
+		# Debug: Show extracted items
+		if i == 0:
+			print(f"Extracted {len(items)} items:")
+			for j, item in enumerate(items[:5]):  # Show first 5 items
+				print(f"  Item {j+1}: {item}")
+			if items:
+				print(f"  ... and {len(items)-5} more items" if len(items) > 5 else "")
+			print(f"Total: {total_value}")
+			print()
 
 		pages.append({
 			"page_index": i,
