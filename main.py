@@ -1,5 +1,5 @@
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import fitz  # PyMuPDF
 import io
 import json
@@ -26,11 +26,13 @@ model.to(device).eval()
 
 DATA_DIR = Path("data")
 OUT_DIR = Path("parsed_data")
+VISUALIZATION_DIR = Path("visualized_data")
 
 
 def ensure_dirs():
     DATA_DIR.mkdir(exist_ok=True)
     OUT_DIR.mkdir(exist_ok=True)
+    VISUALIZATION_DIR.mkdir(exist_ok=True)
 
 
 def load_pages(path: Path, dpi: int = 300):
@@ -177,6 +179,22 @@ def parse_pages_to_entities(images, source_path: Path):
 		labels = predict_labels(encoding)
 		word_triplets = align_predictions_to_words(labels, word_ids, words)
 		
+		# Create word-level labels list for visualization
+		word_labels = ['O'] * len(words)  # Initialize with 'O' (no label)
+		for word, label, wid in word_triplets:
+			if wid < len(word_labels):
+				word_labels[wid] = label
+		
+		# Create annotated image with model labels
+		vis_filename = f"{source_path.stem}_page_{i+1}_annotated.png"
+		vis_path = VISUALIZATION_DIR / vis_filename
+		create_annotated_image(img, words, boxes, word_labels, vis_path)
+		
+		# Also create OCR-only version for comparison
+		ocr_filename = f"{source_path.stem}_page_{i+1}_ocr_only.png"
+		ocr_path = VISUALIZATION_DIR / ocr_filename
+		create_ocr_only_image(img, words, boxes, ocr_path)
+		
 		# Debug: Print model labels and sample predictions
 		if i == 0:  # Only print for first page
 			print(f"\nModel labels: {list(model.config.id2label.values())}")
@@ -291,6 +309,136 @@ def parse_pages_to_entities(images, source_path: Path):
 		"source": str(source_path),
 		"pages": pages,
 	}
+
+def create_annotated_image(image, words, boxes, word_labels=None, output_path=None):
+    """
+    Create an annotated image with bounding boxes around detected text.
+    If word_labels is provided, color-code boxes by label type.
+    """
+    # Create a copy of the image to draw on
+    annotated_img = image.copy()
+    draw = ImageDraw.Draw(annotated_img)
+    
+    # Try to load a font, fall back to default if not available
+    try:
+        font = ImageFont.truetype("arial.ttf", 12)
+    except:
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 12)  # macOS
+        except:
+            font = ImageFont.load_default()
+    
+    # Color scheme for different label types
+    colors = {
+        'name': (255, 0, 0),      # Red for item names
+        'reference': (0, 255, 0), # Green for references
+        'qte': (0, 0, 255),       # Blue for quantities
+        'price': (255, 165, 0),   # Orange for prices
+        'total': (128, 0, 128),   # Purple for totals
+        'default': (0, 0, 0)      # Black for unlabeled
+    }
+    
+    # Convert normalized boxes back to pixel coordinates
+    w, h = image.size
+    
+    for i, (word, box) in enumerate(zip(words, boxes)):
+        # Convert from 0-1000 normalized coordinates back to pixels
+        x0 = int(box[0] * w / 1000)
+        y0 = int(box[1] * h / 1000)
+        x1 = int(box[2] * w / 1000)
+        y1 = int(box[3] * h / 1000)
+        
+        # Determine color based on label
+        color = colors['default']
+        if word_labels and i < len(word_labels):
+            label = word_labels[i]
+            if label != 'O':
+                # Extract base label (remove B-/I- prefix)
+                base = label.split('-')[-1].upper()
+                if 'ITEM' in base or 'DESCRIPTION' in base or 'PRODUCT' in base:
+                    color = colors['name']
+                elif 'REF' in base or 'SKU' in base or 'CODE' in base:
+                    color = colors['reference']
+                elif 'QTY' in base or 'QUANTITY' in base:
+                    color = colors['qte']
+                elif 'PRICE' in base or 'COST' in base or 'AMOUNT' in base:
+                    color = colors['price']
+                elif 'TOTAL' in base:
+                    color = colors['total']
+        
+        # Draw bounding box
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+        
+        # Draw label text above the box
+        label_text = f"{word}"
+        if word_labels and i < len(word_labels):
+            label_text += f" ({word_labels[i]})"
+        
+        # Calculate text position (above the box)
+        text_bbox = draw.textbbox((0, 0), label_text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        
+        text_x = x0
+        text_y = max(0, y0 - text_height - 2)
+        
+        # Draw text background
+        draw.rectangle([text_x, text_y, text_x + text_width, text_y + text_height], 
+                      fill=(255, 255, 255), outline=color)
+        draw.text((text_x, text_y), label_text, fill=color, font=font)
+    
+    # Save the annotated image
+    if output_path:
+        annotated_img.save(output_path)
+        print(f"Saved annotated image: {output_path}")
+    
+    return annotated_img
+
+def create_ocr_only_image(image, words, boxes, output_path=None):
+    """
+    Create a simple annotated image showing only OCR bounding boxes (no model labels).
+    """
+    annotated_img = image.copy()
+    draw = ImageDraw.Draw(annotated_img)
+    
+    # Try to load a font
+    try:
+        font = ImageFont.truetype("arial.ttf", 10)
+    except:
+        font = ImageFont.load_default()
+    
+    # Convert normalized boxes back to pixel coordinates
+    w, h = image.size
+    
+    for i, (word, box) in enumerate(zip(words, boxes)):
+        # Convert from 0-1000 normalized coordinates back to pixels
+        x0 = int(box[0] * w / 1000)
+        y0 = int(box[1] * h / 1000)
+        x1 = int(box[2] * w / 1000)
+        y1 = int(box[3] * h / 1000)
+        
+        # Draw bounding box in blue
+        draw.rectangle([x0, y0, x1, y1], outline=(0, 0, 255), width=1)
+        
+        # Draw word text above the box
+        text_bbox = draw.textbbox((0, 0), word, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        
+        text_x = x0
+        text_y = max(0, y0 - text_height - 1)
+        
+        # Draw text background
+        draw.rectangle([text_x, text_y, text_x + text_width, text_y + text_height], 
+                      fill=(255, 255, 255), outline=(0, 0, 255))
+        draw.text((text_x, text_y), word, fill=(0, 0, 255), font=font)
+    
+    # Save the annotated image
+    if output_path:
+        annotated_img.save(output_path)
+        print(f"Saved OCR-only image: {output_path}")
+    
+    return annotated_img
 
 def save_json(result: dict, input_path: Path):
     out_path = OUT_DIR / f"{input_path.stem}.json"

@@ -5,7 +5,7 @@ env/
 
 # Data directories (contain processed files)
 parsed_data/
-
+visualized_data/
 # Python
 __pycache__/
 *.py[cod]

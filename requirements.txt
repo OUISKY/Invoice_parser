@@ -1,0 +1,21 @@
+# Core ML and AI libraries
+torch>=2.0.0
+transformers>=4.30.0
+safetensors>=0.3.0
+
+# Image processing
+Pillow>=9.0.0
+
+# PDF processing
+PyMuPDF>=1.23.0
+
+# OCR
+pytesseract>=0.3.10
+
+# Additional utilities
+numpy>=1.21.0
+pathlib2>=2.3.0; python_version < "3.4"
+
+# Optional: For better performance on Windows
+# Uncomment the line below if you want to use CUDA-enabled PyTorch
+# torch --index-url https://download.pytorch.org/whl/cu121

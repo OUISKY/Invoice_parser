@@ -32,6 +32,10 @@ python -m venv .venv
 
 3. Install dependencies:
 ```bash
+# Install all dependencies from requirements.txt
+pip install -r requirements.txt
+
+# OR install manually:
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install transformers pillow pymupdf pytesseract safetensors
 ```
