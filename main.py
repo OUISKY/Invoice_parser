@@ -160,6 +160,117 @@ def align_predictions_to_words(labels, word_ids, words):
 		prev = wid
 	return aligned
 
+def _to_float_maybe(text: str):
+    """
+    Best-effort number parser for quantities/prices.
+    Handles currency symbols, spaces, thousands separators, and comma decimals.
+    Returns float or None.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    # Remove currency symbols and common prefixes
+    for ch in ["€", "$", "£", "¥", "AUD", "CAD", "USD", "MAD"]:
+        s = s.replace(ch, "")
+    # Replace non-breaking spaces and regular spaces
+    s = s.replace("\u00A0", "").replace(" ", "")
+    # Normalize separators
+    has_comma = "," in s
+    has_dot = "." in s
+    if has_comma and not has_dot:
+        # Treat comma as decimal separator
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    else:
+        # Remove commas as thousands separators
+        s = s.replace(",", "")
+    # Remove thousand separators like apostrophes
+    s = s.replace("'", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def extract_items_heuristic(words, boxes):
+    """
+    Heuristic fallback when model labels are not sufficient.
+    Groups words into lines by Y center, then per line:
+      - price := right-most numeric token
+      - quantity := nearest numeric to the left of price that is an integer-like value
+      - name := tokens left of quantity (or left of price if no quantity)
+    Skips lines that look like totals.
+    """
+    if not words or not boxes:
+        return []
+
+    # Build tokens with geometry
+    tokens = []
+    for idx, (w, b) in enumerate(zip(words, boxes)):
+        yctr = (b[1] + b[3]) // 2
+        x0 = b[0]
+        tokens.append((yctr, x0, w, idx))
+    tokens.sort()
+
+    # Group into lines by Y proximity
+    lines = []
+    line_tol = 12
+    for y, x, w, idx in tokens:
+        if not lines or abs(y - lines[-1]["y"]) > line_tol:
+            lines.append({"y": y, "tokens": []})
+        lines[-1]["tokens"].append((x, w))
+
+    items = []
+    for line in lines:
+        toks = sorted(line["tokens"], key=lambda t: t[0])
+        words_only = [w for _, w in toks]
+        joined_lower = " ".join(words_only).lower()
+        if "total" in joined_lower:
+            continue
+
+        # Identify numeric tokens with their positions
+        numeric_positions = []  # (index, value)
+        for idx, (_, w) in enumerate(toks):
+            val = _to_float_maybe(w)
+            if val is not None:
+                numeric_positions.append((idx, val))
+
+        if not numeric_positions:
+            # No numeric → cannot infer price/qty; treat whole line as name
+            name = " ".join(words_only).strip()
+            if name:
+                items.append({"name": name})
+            continue
+
+        # Price: right-most numeric
+        price_idx, price_val = numeric_positions[-1]
+        qty_val = None
+        # Quantity: look left for integer-like small value
+        for idx, val in reversed(numeric_positions[:-1]):
+            if abs(idx - price_idx) <= 6:  # close by
+                # Prefer integers or small decimals as quantities
+                if abs(val - round(val)) < 1e-6 and 0 < val < 100000:
+                    qty_val = int(round(val))
+                    break
+                if 0 < val < 10000:
+                    qty_val = val
+                    break
+
+        # Name: tokens left of quantity if exists else left of price
+        cut_idx = qty_val is not None and idx or price_idx
+        name_tokens = [w for _, w in toks[:cut_idx]]
+        name = " ".join(name_tokens).strip()
+        item = {}
+        if name:
+            item["name"] = name
+        if qty_val is not None:
+            item["qte"] = qty_val
+        if price_val is not None:
+            item["price"] = price_val
+        if item:
+            items.append(item)
+
+    return items
+
 def parse_pages_to_entities(images, source_path: Path):
 	pages = []
 	for i, img in enumerate(images):
@@ -185,15 +296,13 @@ def parse_pages_to_entities(images, source_path: Path):
 			if wid < len(word_labels):
 				word_labels[wid] = label
 		
-		# Create annotated image with model labels
-		vis_filename = f"{source_path.stem}_page_{i+1}_annotated.png"
-		vis_path = VISUALIZATION_DIR / vis_filename
-		create_annotated_image(img, words, boxes, word_labels, vis_path)
+		# Create annotated image with model labels (in memory only)
+		annotated_img = create_annotated_image(img, words, boxes, word_labels)
 		
-		# Also create OCR-only version for comparison
-		ocr_filename = f"{source_path.stem}_page_{i+1}_ocr_only.png"
-		ocr_path = VISUALIZATION_DIR / ocr_filename
-		create_ocr_only_image(img, words, boxes, ocr_path)
+		# Store the annotated image for PDF creation later
+		if 'annotated_images' not in locals():
+			annotated_images = []
+		annotated_images.append(annotated_img)
 		
 		# Debug: Print model labels and sample predictions
 		if i == 0:  # Only print for first page
@@ -286,6 +395,23 @@ def parse_pages_to_entities(images, source_path: Path):
 					item[key] = " ".join(w for x, w in sorted(parts[key], key=lambda t: t[0]))
 			if item:
 				items.append(item)
+
+		# Heuristic fallback if items look empty or poor
+		if not items:
+			items = extract_items_heuristic(words, boxes)
+
+		# Compute sum of line prices if available
+		total_items_sum = None
+		acc = 0.0
+		found_any = False
+		for it in items:
+			price_val = _to_float_maybe(str(it.get("price", "")))
+			qty_val = _to_float_maybe(str(it.get("qte", ""))) or 1.0
+			if price_val is not None:
+				acc += price_val  # if price is already line total
+				found_any = True
+		if found_any:
+			total_items_sum = round(acc, 2)
 		
 		# Debug: Show extracted items
 		if i == 0:
@@ -302,15 +428,24 @@ def parse_pages_to_entities(images, source_path: Path):
 			"width": w,
 			"height": h,
 			"items": items,
-			"total": total_value
+			"total": total_value,
+			"total_items_sum": total_items_sum
 		})
+
+	# After processing pages, build a single annotated PDF for this source
+	try:
+		if 'annotated_images' in locals() and annotated_images:
+			pdf_out = VISUALIZATION_DIR / f"{source_path.stem}_annotated.pdf"
+			create_pdf_from_images_in_memory(annotated_images, pdf_out)
+	except Exception as e:
+		print(f"Warning: failed to create annotated PDF for {source_path.name}: {e}")
 
 	return {
 		"source": str(source_path),
 		"pages": pages,
 	}
 
-def create_annotated_image(image, words, boxes, word_labels=None, output_path=None):
+def create_annotated_image(image, words, boxes, word_labels=None):
     """
     Create an annotated image with bounding boxes around detected text.
     If word_labels is provided, color-code boxes by label type.
@@ -387,14 +522,9 @@ def create_annotated_image(image, words, boxes, word_labels=None, output_path=No
                       fill=(255, 255, 255), outline=color)
         draw.text((text_x, text_y), label_text, fill=color, font=font)
     
-    # Save the annotated image
-    if output_path:
-        annotated_img.save(output_path)
-        print(f"Saved annotated image: {output_path}")
-    
     return annotated_img
 
-def create_ocr_only_image(image, words, boxes, output_path=None):
+def create_ocr_only_image(image, words, boxes):
     """
     Create a simple annotated image showing only OCR bounding boxes (no model labels).
     """
@@ -433,12 +563,25 @@ def create_ocr_only_image(image, words, boxes, output_path=None):
                       fill=(255, 255, 255), outline=(0, 0, 255))
         draw.text((text_x, text_y), word, fill=(0, 0, 255), font=font)
     
-    # Save the annotated image
-    if output_path:
-        annotated_img.save(output_path)
-        print(f"Saved OCR-only image: {output_path}")
-    
     return annotated_img
+
+def create_pdf_from_images_in_memory(images, output_pdf_path: Path):
+    """
+    Combine a list of PIL images in memory into a single multi-page PDF.
+    """
+    pdf_doc = fitz.open()
+    try:
+        for img in images:
+            width, height = img.size
+            page = pdf_doc.new_page(width=width, height=height)
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
+            page.insert_image(fitz.Rect(0, 0, width, height), stream=img_bytes.getvalue())
+        pdf_doc.save(str(output_pdf_path))
+        print(f"Saved annotated PDF: {output_pdf_path}")
+    finally:
+        pdf_doc.close()
 
 def save_json(result: dict, input_path: Path):
     out_path = OUT_DIR / f"{input_path.stem}.json"
